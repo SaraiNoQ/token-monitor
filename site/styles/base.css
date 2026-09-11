@@ -12,10 +12,7 @@ body {
   overflow-x: hidden;
   overflow-x: clip;
   color: var(--text);
-  background:
-    radial-gradient(circle at 15% 0%, rgba(255,95,86,0.08), transparent 28rem),
-    var(--bg-glow),
-    var(--bg);
+  background: var(--bg-glow), var(--bg);
   background-attachment: fixed;
   font-family: var(--sans);
   line-height: 1.55;
@@ -54,7 +51,7 @@ h2 {
 }
 h3 { margin: 0 0 0.5rem; font-size: 1.15rem; letter-spacing: 0; }
 h1, h2, h3 { text-wrap: balance; }
-.lede, .feature-copy p { text-wrap: pretty; }
+.lede, .tour-item-text { text-wrap: pretty; }
 
 .section-head { max-width: 720px; margin-bottom: 2.5rem; }
 .lede { max-width: 640px; color: var(--muted); font-size: 1.08rem; }

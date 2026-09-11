@@ -6,6 +6,16 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { extractUsageFromTokscale, mergePeriods } = require('../../src/shared/usage');
+const { installInProcessWatchHost } = require('../helpers/watchHost');
+
+installInProcessWatchHost(test);
+
+// Isolate the shared data dir so startCollector's persisted collector-anchor.json
+// does not write the real user data dir during the suite.
+const sharedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tm-force-limits-'));
+process.env.TOKEN_MONITOR_SHARED_DIR = sharedDir;
+process.on('exit', () => { try { fs.rmSync(sharedDir, { recursive: true, force: true }); } catch (_) {} });
 
 function fakeTokscaleSpawn() {
   return () => {
@@ -22,63 +32,62 @@ function fakeTokscaleSpawn() {
   };
 }
 
-function waitForUpdates(updates, count) {
-  if (updates.length >= count) return Promise.resolve();
-  return new Promise((resolve) => {
-    const interval = setInterval(() => {
-      if (updates.length >= count) {
-        clearInterval(interval);
-        resolve();
-      }
-    }, 5);
-  });
-}
-
-test('manual collector tick can force the limits snapshot', async () => {
-  const childProcess = require('node:child_process');
-  const originalSpawn = childProcess.spawn;
-  childProcess.spawn = fakeTokscaleSpawn();
-
-  const limitCollectorPath = require.resolve('../../src/shared/limitCollector');
+async function withQoderCollectorMock(mocks, callback) {
   const collectorPath = require.resolve('../../src/shared/collector');
-  const limitCollector = require(limitCollectorPath);
-  const originalCreateLimitsCollector = limitCollector.createLimitsCollector;
-  const snapshotForces = [];
-  limitCollector.createLimitsCollector = () => ({
-    snapshot: async (force = false) => {
-      snapshotForces.push(Boolean(force));
-      return { updatedAt: new Date().toISOString(), refreshMs: 300000, providers: [] };
-    }
-  });
+  const qoderCnUsage = require('../../src/shared/providers/qodercn/usage');
+  const originals = Object.fromEntries(Object.keys(mocks).map((key) => [key, qoderCnUsage[key]]));
+  Object.assign(qoderCnUsage, mocks);
   delete require.cache[collectorPath];
-
   try {
-    const { startCollector } = require(collectorPath);
-    const updates = [];
-    const handle = startCollector({
-      clients: 'claude',
-      allTimeSince: '2024-01-01',
-      commandTimeoutMs: 1000,
-      deviceId: 'test-device',
-      agentVersion: 'test',
-      intervalMs: 60000,
-      watchEnabled: false,
-      watchDebounceMs: 10,
-      limitsEnabled: true,
-      onUpdate: (summary, reason) => updates.push({ summary, reason })
-    });
-
-    await waitForUpdates(updates, 1);
-    await handle.tick('manual', { forceLimits: true });
-    await waitForUpdates(updates, 2);
-    handle.stop();
-
-    assert.deepEqual(snapshotForces.slice(0, 2), [false, true]);
+    return await callback(require(collectorPath));
   } finally {
-    childProcess.spawn = originalSpawn;
-    limitCollector.createLimitsCollector = originalCreateLimitsCollector;
+    Object.assign(qoderCnUsage, originals);
     delete require.cache[collectorPath];
   }
+}
+
+test('reset boundary scheduling caps timers that exceed the Node timeout range', () => {
+  const collectorPath = require.resolve('../../src/shared/collector');
+  delete require.cache[collectorPath];
+  const {
+    LIMITS_RESET_BOUNDARY_MAX_TIMER_MS,
+    nextLimitsResetBoundary
+  } = require(collectorPath);
+  const now = Date.parse('2026-07-01T00:00:00.000Z');
+  const next = nextLimitsResetBoundary({
+    providers: [{
+      provider: 'copilot',
+      accountKey: 'copilot-test',
+      windows: [{ kind: 'monthly', resetsAt: '2026-08-01T00:00:00.000Z' }]
+    }]
+  }, now);
+
+  assert.equal(next.delayMs, LIMITS_RESET_BOUNDARY_MAX_TIMER_MS);
+  assert.equal(next.refreshAt, Date.parse('2026-08-01T00:00:30.000Z'));
+  delete require.cache[collectorPath];
+});
+
+test('reset boundary scheduling prunes historical attempted keys but retains current stale keys', () => {
+  const collectorPath = require.resolve('../../src/shared/collector');
+  delete require.cache[collectorPath];
+  const {
+    nextLimitsResetBoundary,
+    pruneAttemptedResetBoundaries
+  } = require(collectorPath);
+  const limits = {
+    providers: [{
+      provider: 'codex',
+      accountKey: 'codex-test',
+      windows: [{ kind: 'session', resetsAt: '2026-07-20T00:01:00.000Z' }]
+    }]
+  };
+  const currentKey = nextLimitsResetBoundary(limits).keys[0];
+  const attempted = new Set(['historical-reset-key', currentKey]);
+
+  pruneAttemptedResetBoundaries(limits, attempted);
+
+  assert.deepEqual([...attempted], [currentKey]);
+  delete require.cache[collectorPath];
 });
 
 test('collectUsageOnce returns empty usage without spawning tokscale when clients is empty', async () => {
@@ -120,6 +129,133 @@ test('collectUsageOnce returns empty usage without spawning tokscale when client
     assert.equal(summary.allTime.totalTokens, 0);
   } finally {
     childProcess.spawn = originalSpawn;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('collectUsageOnce handles proma-only tracking without spawning tokscale', async () => {
+  const promaPath = require.resolve('../../src/shared/providers/proma/usage');
+  const collectorPath = require.resolve('../../src/shared/collector');
+  const promaUsage = require(promaPath);
+  const originalBuildPromaPeriods = promaUsage.buildPromaPeriods;
+  let tokscaleCalls = 0;
+
+  promaUsage.buildPromaPeriods = () => ({
+    today: { entries: [{ client: 'proma', model: 'm', input: 12, output: 3 }] },
+    month: { entries: [{ client: 'proma', model: 'm', input: 20 }] },
+    allTime: { entries: [{ client: 'proma', model: 'm', input: 30 }] }
+  });
+  delete require.cache[collectorPath];
+
+  try {
+    const { collectUsageOnce } = require(collectorPath);
+    const summary = await collectUsageOnce({
+      clients: 'proma',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false,
+      runTokscale: async () => {
+        tokscaleCalls += 1;
+        throw new Error('tokscale should not run for proma-only tracking');
+      }
+    });
+
+    assert.equal(tokscaleCalls, 0);
+    assert.deepEqual(summary.trackedClients, ['proma']);
+    assert.equal(summary.today.clients.proma, 15);
+    assert.equal(summary.month.clients.proma, 20);
+    assert.equal(summary.allTime.clients.proma, 30);
+  } finally {
+    promaUsage.buildPromaPeriods = originalBuildPromaPeriods;
+    delete require.cache[collectorPath];
+  }
+});
+
+test('collectUsageOnce handles qodercn-only tracking without spawning tokscale', async () => {
+  let tokscaleCalls = 0;
+
+  await withQoderCollectorMock({
+    collectQoderCnRows: async () => [],
+    buildQoderCnPeriods: () => ({
+      today: { entries: [{ client: 'qodercn', model: 'qmodel', input: 12, output: 3 }] },
+      month: { entries: [{ client: 'qodercn', model: 'qmodel', input: 20 }] },
+      allTime: { entries: [{ client: 'qodercn', model: 'qmodel', input: 30 }] }
+    })
+  }, async ({ collectUsageOnce }) => {
+    const summary = await collectUsageOnce({
+      clients: 'qodercn',
+      allTimeSince: '2024-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      agentVersion: 'test',
+      limitsEnabled: false,
+      runTokscale: async () => {
+        tokscaleCalls += 1;
+        throw new Error('tokscale should not run for qodercn-only tracking');
+      }
+    });
+
+    assert.equal(tokscaleCalls, 0);
+    assert.deepEqual(summary.trackedClients, ['qodercn']);
+    assert.equal(summary.today.clients['qodercn'], 15);
+    assert.equal(summary.month.clients['qodercn'], 20);
+    assert.equal(summary.allTime.clients['qodercn'], 30);
+  });
+});
+
+test('anchored Proma refresh derives broader windows from the combined fresh today period', async () => {
+  const promaPath = require.resolve('../../src/shared/providers/proma/usage');
+  const collectorPath = require.resolve('../../src/shared/collector');
+  const promaUsage = require(promaPath);
+  const originalBuildPromaPeriods = promaUsage.buildPromaPeriods;
+  let receivedAllTimeSince = null;
+
+  const period = (client, input) => extractUsageFromTokscale({
+    entries: [{ client, model: 'm', input, output: 0, cost: 0 }]
+  });
+  const anchor = {
+    dateKey: require('../../src/shared/collector').localTodayKey(),
+    today: mergePeriods(period('claude', 10), period('proma', 5)),
+    month: mergePeriods(period('claude', 100), period('proma', 50)),
+    allTime: mergePeriods(period('claude', 1000), period('proma', 500))
+  };
+
+  promaUsage.buildPromaPeriods = ({ allTimeSince }) => {
+    receivedAllTimeSince = allTimeSince;
+    return {
+      today: { entries: [{ client: 'proma', model: 'm', input: 8 }] },
+      month: { entries: [{ client: 'proma', model: 'm', input: 53 }] },
+      allTime: { entries: [{ client: 'proma', model: 'm', input: 503 }] }
+    };
+  };
+  delete require.cache[collectorPath];
+
+  try {
+    const { collectUsageOnce } = require(collectorPath);
+    const summary = await collectUsageOnce({
+      clients: 'claude,proma',
+      allTimeSince: '2026-01-01',
+      commandTimeoutMs: 1000,
+      deviceId: 'test-device',
+      limitsEnabled: false,
+      todayOnlyAnchor: anchor,
+      runTokscale: async ({ clients, flags }) => {
+        assert.equal(clients, 'claude');
+        assert.deepEqual(flags, ['--today']);
+        return { entries: [{ client: 'claude', model: 'm', input: 15 }] };
+      }
+    });
+
+    assert.equal(receivedAllTimeSince, '2026-01-01');
+    assert.equal(summary.today.totalTokens, 23);
+    assert.equal(summary.month.totalTokens, 158);
+    assert.equal(summary.allTime.totalTokens, 1508);
+    assert.equal(summary.month.clients.proma, 53);
+    assert.equal(summary.allTime.clients.proma, 503);
+  } finally {
+    promaUsage.buildPromaPeriods = originalBuildPromaPeriods;
     delete require.cache[collectorPath];
   }
 });

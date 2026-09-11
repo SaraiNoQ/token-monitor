@@ -5,8 +5,23 @@ const path = require('node:path');
 const { defaultDeviceId, loadDotEnv, parseArgs, pidFilePath } = require('../shared/config');
 const { appVersion } = require('../shared/appVersion');
 const { clientsCsvForSetting } = require('../shared/clientTracking');
-const { collectUsageOnce, startCollector } = require('../shared/collector');
-const { normalizeLimitsRefreshMs, parseBoolean, parseLimitProviders } = require('../shared/limitCollector');
+const { normalizeHistoryIntervalMs } = require('../shared/collector');
+const {
+  normalizeLimitsRefreshMode,
+  normalizeLimitsRefreshMs,
+  parseBoolean,
+  parseLimitProviders
+} = require('../shared/limits/collector');
+const { postSyncPayload } = require('../shared/syncPayload');
+const { applyProjectRollups } = require('../shared/usage');
+const { runAgent, runAgentOnce } = require('./runtime');
+const {
+  applySessionUsageArchive,
+  captureSessionUsageArchive,
+  readSessionUsageArchive,
+  sessionUsageArchiveDate,
+  writeSessionUsageArchive
+} = require('../shared/sessionUsageArchive');
 
 loadDotEnv();
 const args = parseArgs(process.argv.slice(2));
@@ -22,17 +37,91 @@ const commandTimeoutMs = Number(args.timeoutMs || process.env.TOKEN_MONITOR_TOKS
 const limitsEnabled = parseBoolean(args.limits ?? args.limitsEnabled ?? process.env.TOKEN_MONITOR_LIMITS_ENABLED, true);
 const limitProviders = parseLimitProviders(args.limitProviders ?? process.env.TOKEN_MONITOR_LIMIT_PROVIDERS).join(',');
 const limitsRefreshMs = normalizeLimitsRefreshMs(args.limitsRefreshMs || process.env.TOKEN_MONITOR_LIMITS_REFRESH_MS);
+const limitsRefreshMode = normalizeLimitsRefreshMode(args.limitsRefreshMode || process.env.TOKEN_MONITOR_LIMITS_REFRESH_MODE);
+const historyEnabled = parseBoolean(args.history ?? args.historyEnabled ?? process.env.TOKEN_MONITOR_HISTORY_ENABLED, true);
+const projectsEnabled = parseBoolean(args.projects ?? args.projectsEnabled ?? process.env.TOKEN_MONITOR_PROJECTS_ENABLED, false);
+const sessionUsageArchiveEnabled = parseBoolean(args.sessionArchive ?? args.sessionUsageArchiveEnabled ?? process.env.TOKEN_MONITOR_SESSION_USAGE_ARCHIVE_ENABLED, true);
+const wslScanEnabled = parseBoolean(args.wslScan ?? args.wslScanEnabled ?? process.env.TOKEN_MONITOR_WSL_SCAN, true);
+const opencodeLocalLimitsEnabled = parseBoolean(
+  args['opencode-local-limits']
+    ?? args.opencodeLocalLimits
+    ?? args.opencodeLocalLimitsEnabled
+    ?? process.env.TOKEN_MONITOR_OPENCODE_LOCAL_LIMITS,
+  false
+);
+// The key OpenCode stores for itself needs no configuration, so an unattended
+// agent reports it by default. Switched off for a machine signed in to an
+// account whose quota should not leave it. The widget resolves the same setting
+// through settings.json; here it is env or flag, like every other agent option.
+const opencodeAmbientEnabled = parseBoolean(
+  args['opencode-ambient']
+    ?? args.opencodeAmbient
+    ?? args.opencodeAmbientEnabled
+    ?? process.env.TOKEN_MONITOR_OPENCODE_AMBIENT,
+  true
+);
 const opencodeCookie = String(process.env.TOKEN_MONITOR_OPENCODE_COOKIE || '').trim();
 const once = Boolean(args.once);
 const dryRun = Boolean(args['dry-run'] || args.dryRun);
 
-const collectorOptions = { clients, allTimeSince, commandTimeoutMs, deviceId, agentVersion: appVersion(), agentRuntime: 'headless-agent', limitsEnabled, limitProviders, limitsRefreshMs, opencodeCookie };
+const usageOptions = {
+  clients,
+  allTimeSince,
+  commandTimeoutMs,
+  deviceId,
+  agentVersion: appVersion(),
+  agentRuntime: 'headless-agent',
+  projectsEnabled,
+  historyEnabled,
+  historyIntervalMs: normalizeHistoryIntervalMs(process.env.TOKEN_MONITOR_HISTORY_INTERVAL_MS),
+  dailyHistoryArchiveEnabled: sessionUsageArchiveEnabled,
+  dailyHistoryArchiveWriteEnabled: !dryRun,
+  anchorPersistenceEnabled: !once && !dryRun,
+  intervalMs,
+  watchEnabled,
+  watchDebounceMs,
+  wslScanEnabled,
+  onError: (error, reason) => console.error(`[${new Date().toISOString()}] (${reason}) ${error.message}`),
+  logger: (message) => (dryRun ? console.error(message) : console.log(message))
+};
+const limitsOptions = {
+  limitsEnabled,
+  limitProviders,
+  limitsRefreshMode,
+  limitsRefreshMs,
+  claudeWebCookie: '',
+  opencodeLocalLimitsEnabled,
+  opencodeAmbientEnabled,
+  opencodeCookie
+};
+let sessionUsageArchive;
+
+function summaryWithSessionUsageArchive(summary, now = new Date()) {
+  let visibleSummary = summary;
+  if (sessionUsageArchiveEnabled) {
+    const archiveDate = sessionUsageArchiveDate(summary, now);
+    const previous = sessionUsageArchive || readSessionUsageArchive();
+    const next = captureSessionUsageArchive(previous, summary, archiveDate);
+    if (!dryRun && JSON.stringify(next) !== JSON.stringify(previous)) {
+      try {
+        writeSessionUsageArchive(next);
+        sessionUsageArchive = next;
+      } catch (error) {
+        console.error(`[session-archive] write failed: ${error.message}`);
+      }
+    } else if (!dryRun) {
+      sessionUsageArchive = next;
+    }
+    visibleSummary = applySessionUsageArchive(summary, next, { now: archiveDate });
+  }
+  return projectsEnabled ? applyProjectRollups(visibleSummary) : visibleSummary;
+}
 
 async function postUsage(summary) {
-  const response = await fetch(`${hubUrl}/api/ingest`, {
-    method: 'POST',
+  const { response } = await postSyncPayload(fetch, `${hubUrl}/api/ingest`, {
     headers: { 'content-type': 'application/json', ...(secret ? { authorization: `Bearer ${secret}` } : {}) },
-    body: JSON.stringify(summary)
+    summary,
+    logger: (message) => console.warn(`[sync] ${message}`)
   });
   if (!response.ok) throw new Error(`Hub responded ${response.status}: ${(await response.text()).slice(0, 300)}`);
   return response.json();
@@ -44,37 +133,45 @@ async function deliver(summary) {
   console.log(`[${new Date().toISOString()}] posted ${summary.deviceId}: today=${summary.today.totalTokens} month=${summary.month.totalTokens} allTime=${summary.allTime.totalTokens}`);
 }
 
-function registerPidFile() {
+function registerPidFile(stopRuntime) {
   const pidPath = pidFilePath();
   fs.mkdirSync(path.dirname(pidPath), { recursive: true });
   fs.writeFileSync(pidPath, String(process.pid), 'utf8');
   const cleanup = () => { try { fs.unlinkSync(pidPath); } catch (_) {} };
   process.on('exit', cleanup);
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-    process.on(sig, () => { cleanup(); process.exit(0); });
+    process.on(sig, () => {
+      try { stopRuntime?.(); } catch (_) {}
+      cleanup();
+      process.exit(0);
+    });
   }
 }
 
 async function main() {
-  console.log(`Token Monitor agent device=${deviceId} hub=${hubUrl} intervalMs=${intervalMs} watch=${watchEnabled} limits=${limitsEnabled ? `${limitProviders || 'none'}:${limitsRefreshMs}ms` : 'off'}`);
+  const startupMessage = `Token Monitor agent device=${deviceId} hub=${hubUrl} intervalMs=${intervalMs} watch=${watchEnabled} projects=${projectsEnabled ? 'on' : 'off'} history=${historyEnabled ? 'on' : 'off'} sessionArchive=${sessionUsageArchiveEnabled ? 'on' : 'off'} limits=${limitsEnabled ? `${limitProviders || 'none'}:${limitsRefreshMode === 'adaptive' ? 'adaptive' : `${limitsRefreshMs}ms`}` : 'off'}`;
+  if (dryRun) console.error(startupMessage);
+  else console.log(startupMessage);
   if (!secret) console.warn('Warning: TOKEN_MONITOR_SECRET is not set. Posting without authorization header.');
+  // Claim archive ownership before either a one-shot or long-running scan so
+  // Electron can yield before its history read-modify-write reaches disk.
+  let runtimeHandle = null;
+  if (!dryRun) registerPidFile(() => runtimeHandle?.stop());
+  const runtimeOptions = {
+    envelope: { deviceId, agentVersion: appVersion(), agentRuntime: 'headless-agent' },
+    usageOptions,
+    limitsOptions,
+    transformUsage: summaryWithSessionUsageArchive,
+    deliver,
+    dryRun,
+    onRuntime: (runtime) => { runtimeHandle = runtime; },
+    onError: (error, reason) => console.error(`[${new Date().toISOString()}] (${reason}) ${error.message}`)
+  };
   if (once) {
-    const summary = await collectUsageOnce(collectorOptions);
-    await deliver(summary);
+    await runAgentOnce(runtimeOptions);
     return;
   }
-  if (!dryRun) registerPidFile();
-  startCollector({
-    ...collectorOptions,
-    intervalMs,
-    watchEnabled,
-    watchDebounceMs,
-    onUpdate: (summary, reason) => {
-      deliver(summary).catch((error) => console.error(`[${new Date().toISOString()}] (${reason}) ${error.message}`));
-    },
-    onError: (error, reason) => console.error(`[${new Date().toISOString()}] (${reason}) ${error.message}`),
-    logger: (msg) => console.log(msg)
-  });
+  runtimeHandle = runAgent(runtimeOptions);
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });

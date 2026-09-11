@@ -14,6 +14,7 @@ const {
   orderedViews,
   preferredViewId,
   reorderViewDisplayOrder,
+  visibleViewCount,
   visibleViewOrder
 } = require('../../src/electron/renderer/viewDisplayPreferences');
 
@@ -24,6 +25,20 @@ const views = [
   { id: 'session', label: 'Sessions' },
   { id: 'limits', label: 'Limits' }
 ];
+
+function extractViewIds(source, constantName) {
+  const mappedMatch = source.match(new RegExp(`const ${constantName} = \\[([^\\]]+)\\]\\.map`));
+  if (mappedMatch) {
+    return [...mappedMatch[1].matchAll(/'([^']+)'/g)].map((match) => match[1]);
+  }
+
+  const literalMatch = source.match(new RegExp(`const ${constantName} = \\[([\\s\\S]*?)\\];`));
+  if (literalMatch) {
+    return [...literalMatch[1].matchAll(/id:\s*'([^']+)'/g)].map((match) => match[1]);
+  }
+
+  assert.fail(`Could not find ${constantName}`);
+}
 
 test('defaultViewDisplayPreferences hides the Status view by default', () => {
   assert.deepEqual(defaultViewDisplayPreferences(), {
@@ -36,6 +51,28 @@ test('main default settings use the default view display preferences', () => {
   const mainSource = fs.readFileSync(path.join(__dirname, '../../src/electron/main.js'), 'utf8');
   assert.match(mainSource, /defaultViewDisplayPreferences/);
   assert.match(mainSource, /hiddenViews:\s*defaultViewDisplayPreferences\(\)\.hiddenViews/);
+  assert.match(mainSource, /projectsEnabled:\s*parseBoolean\(process\.env\.TOKEN_MONITOR_PROJECTS_ENABLED, false\)/);
+});
+
+test('main default settings include independent Home module preferences', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '../../src/electron/main.js'), 'utf8');
+  assert.match(mainSource, /defaultHomeModulePreferences/);
+  assert.match(mainSource, /homeModuleOrder:\s*defaultHomeModulePreferences\(\)\.homeModuleOrder/);
+  assert.match(mainSource, /hiddenHomeModules:\s*defaultHomeModulePreferences\(\)\.hiddenHomeModules/);
+  assert.match(mainSource, /homeLimitProviderOrder:\s*''/);
+  assert.match(mainSource, /function migrateHomeLimitProviderOrder/);
+  assert.match(mainSource, /homeLimitProviderOrder:\s*patch\.homeLimitProviderOrder !== undefined \? migrateHomeLimitProviderOrder\(patch\.homeLimitProviderOrder\) : \(settings\.homeLimitProviderOrder \|\| ''\)/);
+  assert.match(mainSource, /hiddenHomeLimitProviders:\s*''/);
+});
+
+test('main and renderer keep their view display options in sync', () => {
+  const mainSource = fs.readFileSync(path.join(__dirname, '../../src/electron/main.js'), 'utf8');
+  const rendererSource = fs.readFileSync(path.join(__dirname, '../../src/electron/renderer/app.js'), 'utf8');
+
+  assert.deepEqual(
+    extractViewIds(mainSource, 'DEFAULT_VIEW_LIST'),
+    extractViewIds(rendererSource, 'VIEW_DISPLAY_OPTIONS')
+  );
 });
 
 test('normalizeViewDisplayOrder drops invalid entries and appends missing views', () => {
@@ -95,6 +132,19 @@ test('visibleViewOrder applies order, hidden views, and runtime availability', (
   );
 });
 
+test('visibleViewOrder temporarily includes a directly opened hidden view in configured order', () => {
+  assert.deepEqual(
+    visibleViewOrder({
+      views,
+      orderValue: 'session,limits,tool,device,model',
+      hiddenValue: 'device,session',
+      availableIds: ['tool', 'device', 'model', 'session'],
+      includeIds: ['device']
+    }),
+    ['tool', 'device', 'model']
+  );
+});
+
 test('visibleViewOrder falls back to the first available view when preferences hide every available view', () => {
   assert.deepEqual(
     visibleViewOrder({
@@ -141,4 +191,24 @@ test('hasViewDisplayPreferences detects custom order or hidden views', () => {
   assert.equal(hasViewDisplayPreferences('', 'unknown', views), false);
   assert.equal(hasViewDisplayPreferences('session,tool', '', views), true);
   assert.equal(hasViewDisplayPreferences('', 'model', views), true);
+});
+
+test('visible count treats a disabled view as hidden, not as visible', () => {
+  // A disabled view (Trends without history, Projects when off) renders with the
+  // eye-off icon and is filtered out of the runtime rotation, so counting it as
+  // visible both overstates the settings summary and weakens the guard that
+  // stops the last visible view from being hidden.
+  assert.equal(visibleViewCount({ views, hiddenValue: '' }), 5);
+  assert.equal(visibleViewCount({ views, hiddenValue: 'device' }), 4);
+  assert.equal(visibleViewCount({ views, hiddenValue: 'device', disabledIds: ['model'] }), 3);
+  // A view that is both hidden and disabled must only be discounted once.
+  assert.equal(visibleViewCount({ views, hiddenValue: 'device', disabledIds: ['device'] }), 4);
+});
+
+test('the last remaining view cannot be hidden once disabled views are discounted', () => {
+  // Everything hidden except Tools, with Limits disabled: one view is left, so
+  // the guard (count <= 1) has to fire. Counting Limits as visible would report
+  // two and let the user reach a main screen with nothing on it.
+  const hiddenValue = 'device,model,session';
+  assert.equal(visibleViewCount({ views, hiddenValue, disabledIds: ['limits'] }), 1);
 });

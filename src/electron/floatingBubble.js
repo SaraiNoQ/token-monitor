@@ -5,8 +5,8 @@ const FLOATING_BUBBLE_HANDLE_HEIGHT = 34;
 const FLOATING_BUBBLE_MARGIN = 8;
 const FLOATING_BUBBLE_COLLAPSED_MARGIN = { x: 0, y: FLOATING_BUBBLE_MARGIN };
 const FLOATING_BUBBLE_WINDOWS_COLLAPSED_MARGIN = { x: 0, y: 0 };
-const INITIAL_RENDERER_PERIODS = new Set(['today', 'month', 'allTime']);
-const INITIAL_RENDERER_BREAKDOWNS = new Set(['tool', 'status', 'device', 'model', 'session', 'limits']);
+const INITIAL_RENDERER_PERIODS = new Set(['today', 'month', 'week', 'last7', 'last30', 'allTime']);
+const INITIAL_RENDERER_BREAKDOWNS = new Set(['home', 'tool', 'status', 'device', 'model', 'project', 'session', 'limits', 'trends']);
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, Number(value)));
@@ -18,9 +18,8 @@ function canUseFloatingBubble(settings = {}) {
     settings.windowBehavior !== 'desktop';
 }
 
-function floatingBubbleNativeGlassEnabled(settings = {}, state = {}, platform = process.platform) {
-  if (platform === 'win32' && state?.collapsed === true) return false;
-  return settings?.systemGlass !== false && state?.collapsed !== true;
+function floatingBubbleNativeGlassEnabled(settings = {}) {
+  return settings?.systemGlass !== false;
 }
 
 function floatingBubbleCollapsedArea(display, platform = process.platform) {
@@ -36,7 +35,7 @@ function floatingBubbleWindowChrome(platform = process.platform, collapsed = fal
   if (platform !== 'win32' || collapsed !== true) return {};
   return {
     hasShadow: false,
-    roundedCorners: false,
+    roundedCorners: true,
     thickFrame: false
   };
 }
@@ -58,11 +57,12 @@ function normalizeInitialRendererViewState(value = {}, fallback = {}) {
 }
 
 function initialRendererViewStateQuery(viewState = {}) {
+  // Always carry both fields. Omitting a value just because it equals the
+  // default ('today'/'tool') is lossy: the renderer can't then tell "the user
+  // is on tool" from "no view was provided", and falls back to the first
+  // custom-ordered view — silently losing a persisted last view of tool/today.
   const normalized = normalizeInitialRendererViewState(viewState);
-  const query = {};
-  if (normalized.period !== 'today') query.period = normalized.period;
-  if (normalized.breakdown !== 'tool') query.breakdown = normalized.breakdown;
-  return query;
+  return { period: normalized.period, breakdown: normalized.breakdown };
 }
 
 function floatingBubbleInitialRendererQuery(state = {}, options = false) {

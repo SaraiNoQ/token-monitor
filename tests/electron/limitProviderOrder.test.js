@@ -10,6 +10,7 @@ const {
   orderedLimitProviders,
   reorderLimitProvider
 } = require('../../src/electron/renderer/limitProviderOrder');
+const { LIMIT_PROVIDER_CATALOG } = require('../../src/shared/limitProviders');
 
 const providers = [
   { id: 'claude', label: 'Claude' },
@@ -17,6 +18,43 @@ const providers = [
   { id: 'cursor', label: 'Cursor' },
   { id: 'antigravity', label: 'Antigravity' }
 ];
+
+// The expected list stays spelled out rather than derived: this order is the
+// default a fresh install writes to settings.limitProviderOrder, so changing it
+// is a compatibility decision that should have to be made in a diff. Since the
+// catalog became the single source for both the ids and the renderer's list,
+// this hand-written copy is the only independent check left on that order —
+// comparing the catalog against anything derived from it proves nothing.
+test('default provider order follows tracked tools, named services, then third-party fallback', () => {
+  const ids = LIMIT_PROVIDER_CATALOG.map((provider) => provider.id);
+
+  assert.deepEqual(ids, [
+    'claude',
+    'codex',
+    'opencode',
+    'cursor',
+    'antigravity',
+    'kimi',
+    'grok',
+    'copilot',
+    'zed',
+    'commandcode',
+    'mimo',
+    'zai',
+    'zaiteam',
+    'kiro',
+    'workbuddy',
+    'qoder',
+    'deepseek',
+    'openrouter',
+    'minimax',
+    'volcengine',
+    'ollama',
+    'trae',
+    'alibaba',
+    'thirdparty'
+  ]);
+});
 
 test('normalizeLimitProviderOrder drops invalid entries and appends missing providers', () => {
   assert.deepEqual(

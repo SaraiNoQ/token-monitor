@@ -16,7 +16,8 @@ const {
   floatingBubbleInitialRendererQuery,
   floatingBubbleNativeGlassEnabled,
   floatingBubbleWindowChrome,
-  moveFloatingBubbleBounds
+  moveFloatingBubbleBounds,
+  normalizeInitialRendererViewState
 } = require('../../src/electron/floatingBubble');
 
 const workArea = { x: 0, y: 24, width: 1440, height: 876 };
@@ -25,6 +26,7 @@ const windowsDisplay = {
   workArea: { x: 0, y: 0, width: 1840, height: 1040 }
 };
 const stylesPath = path.join(__dirname, '..', '..', 'src', 'electron', 'renderer', 'styles.css');
+const appPath = path.join(__dirname, '..', '..', 'src', 'electron', 'renderer', 'app.js');
 const indexPath = path.join(__dirname, '..', '..', 'src', 'electron', 'renderer', 'index.html');
 const bootPath = path.join(__dirname, '..', '..', 'src', 'electron', 'renderer', 'floatingBubbleBoot.js');
 
@@ -41,26 +43,9 @@ test('floating bubble is available only for enabled movable window modes', () =>
   assert.equal(canUseFloatingBubble({ floatingBubbleEnabled: true, windowBehavior: 'floating', trayMode: true }), false);
 });
 
-test('floating bubble disables native system glass while collapsed', () => {
-  assert.equal(floatingBubbleNativeGlassEnabled({ systemGlass: true }, { collapsed: false }), true);
-  assert.equal(floatingBubbleNativeGlassEnabled({ systemGlass: true }, { collapsed: true }), false);
-  assert.equal(floatingBubbleNativeGlassEnabled({ systemGlass: false }, { collapsed: false }), false);
-  assert.equal(
-    floatingBubbleNativeGlassEnabled({ systemGlass: true, floatingBubbleEnabled: true }, { collapsed: false }, 'win32'),
-    true
-  );
-  assert.equal(
-    floatingBubbleNativeGlassEnabled({ systemGlass: false, floatingBubbleEnabled: true }, { collapsed: false }, 'win32'),
-    false
-  );
-  assert.equal(
-    floatingBubbleNativeGlassEnabled({ systemGlass: true, floatingBubbleEnabled: true }, { collapsed: true }, 'win32'),
-    false
-  );
-  assert.equal(
-    floatingBubbleNativeGlassEnabled({ systemGlass: true, floatingBubbleEnabled: true }, { collapsed: false }, 'darwin'),
-    true
-  );
+test('floating bubble native glass follows the system glass setting', () => {
+  assert.equal(floatingBubbleNativeGlassEnabled({ systemGlass: true }), true);
+  assert.equal(floatingBubbleNativeGlassEnabled({ systemGlass: false }), false);
 });
 
 test('floatingBubbleCollapsedArea uses physical display bounds on Windows', () => {
@@ -74,34 +59,77 @@ test('floatingBubbleCollapsedArea uses physical display bounds on Windows', () =
 test('floatingBubbleWindowChrome removes Windows native frame only for collapsed mini-window', () => {
   assert.deepEqual(floatingBubbleWindowChrome('win32', true), {
     hasShadow: false,
-    roundedCorners: false,
+    roundedCorners: true,
     thickFrame: false
   });
   assert.deepEqual(floatingBubbleWindowChrome('win32', false), {});
   assert.deepEqual(floatingBubbleWindowChrome('darwin', true), {});
 });
 
+test('normalizeInitialRendererViewState restores a persisted last-used view', () => {
+  // All main views (incl. Home and Trends) must round-trip so a cold start can
+  // reopen exactly where the user left off.
+  assert.deepEqual(
+    normalizeInitialRendererViewState({ period: 'today', breakdown: 'home' }),
+    { period: 'today', breakdown: 'home' }
+  );
+  assert.deepEqual(
+    normalizeInitialRendererViewState({ period: 'month', breakdown: 'trends' }),
+    { period: 'month', breakdown: 'trends' }
+  );
+  assert.deepEqual(
+    normalizeInitialRendererViewState({ period: 'last7', breakdown: 'model' }),
+    { period: 'last7', breakdown: 'model' }
+  );
+  assert.deepEqual(
+    normalizeInitialRendererViewState({ period: 'allTime', breakdown: 'project' }),
+    { period: 'allTime', breakdown: 'project' }
+  );
+  // A bogus saved snapshot collapses onto the provided fallback rather than the
+  // hard default, so a partial/corrupt value can't wipe the live state.
+  assert.deepEqual(
+    normalizeInitialRendererViewState({ period: 'bad', breakdown: 'bad' }, { period: 'allTime', breakdown: 'session' }),
+    { period: 'allTime', breakdown: 'session' }
+  );
+  // Empty snapshot (fresh install) falls back to the today/tool defaults.
+  assert.deepEqual(
+    normalizeInitialRendererViewState(undefined),
+    { period: 'today', breakdown: 'tool' }
+  );
+});
+
 test('floatingBubbleInitialRendererQuery primes the first collapsed mini-window paint', () => {
+  // The view state always rides along (default today/tool when none is given)
+  // so a persisted last view of tool/today is never mistaken for "no view".
   assert.deepEqual(
     floatingBubbleInitialRendererQuery({ collapsed: true, side: 'right' }, true),
-    { floatingBubbleSide: 'right' }
+    { period: 'today', breakdown: 'tool', floatingBubbleSide: 'right' }
   );
-  assert.equal(floatingBubbleInitialRendererQuery({ collapsed: true, side: 'top' }, true), null);
-  assert.equal(floatingBubbleInitialRendererQuery({ collapsed: false, side: 'right' }, true), null);
-  assert.equal(floatingBubbleInitialRendererQuery({ collapsed: true, side: 'right' }, false), null);
+  assert.deepEqual(
+    floatingBubbleInitialRendererQuery({ collapsed: true, side: 'top' }, true),
+    { period: 'today', breakdown: 'tool' }
+  );
+  assert.deepEqual(
+    floatingBubbleInitialRendererQuery({ collapsed: false, side: 'right' }, true),
+    { period: 'today', breakdown: 'tool' }
+  );
+  assert.deepEqual(
+    floatingBubbleInitialRendererQuery({ collapsed: true, side: 'right' }, false),
+    { period: 'today', breakdown: 'tool' }
+  );
   assert.deepEqual(
     floatingBubbleInitialRendererQuery(
       { collapsed: false, side: null },
       { suppressInitialNumberAnimation: true }
     ),
-    { suppressInitialNumberAnimation: '1' }
+    { period: 'today', breakdown: 'tool', suppressInitialNumberAnimation: '1' }
   );
   assert.deepEqual(
     floatingBubbleInitialRendererQuery(
       { collapsed: true, side: 'left' },
       { collapsedWindow: true, suppressInitialNumberAnimation: true }
     ),
-    { floatingBubbleSide: 'left', suppressInitialNumberAnimation: '1' }
+    { period: 'today', breakdown: 'tool', floatingBubbleSide: 'left', suppressInitialNumberAnimation: '1' }
   );
 });
 
@@ -116,6 +144,15 @@ test('floatingBubbleInitialRendererQuery preserves renderer view state across wi
     ),
     { suppressInitialNumberAnimation: '1', period: 'month', breakdown: 'limits' }
   );
+  // A last view of trends must survive the round-trip too (was dropped before).
+  assert.deepEqual(
+    floatingBubbleInitialRendererQuery(
+      { collapsed: false, side: null },
+      { viewState: { period: 'allTime', breakdown: 'trends' } }
+    ),
+    { period: 'allTime', breakdown: 'trends' }
+  );
+  // A default last view of today/tool is carried explicitly, not omitted.
   assert.deepEqual(
     floatingBubbleInitialRendererQuery(
       { collapsed: false, side: null },
@@ -123,8 +160,9 @@ test('floatingBubbleInitialRendererQuery preserves renderer view state across wi
         viewState: { period: 'today', breakdown: 'status' }
       }
     ),
-    { breakdown: 'status' }
+    { period: 'today', breakdown: 'status' }
   );
+  // A corrupt snapshot collapses to today/tool, still carried explicitly.
   assert.deepEqual(
     floatingBubbleInitialRendererQuery(
       { collapsed: true, side: 'left' },
@@ -133,7 +171,7 @@ test('floatingBubbleInitialRendererQuery preserves renderer view state across wi
         viewState: { period: 'bad', breakdown: 'bad' }
       }
     ),
-    { floatingBubbleSide: 'left' }
+    { period: 'today', breakdown: 'tool', floatingBubbleSide: 'left' }
   );
 });
 
@@ -326,28 +364,73 @@ test('dragFloatingBubbleBounds anchors the mini-window to the OS cursor point', 
   );
 });
 
-test('floating bubble collapsed styles fill the mini window with app glass styling', () => {
+test('glass surfaces keep the shared tint and blur without decorative chrome', () => {
   const css = fs.readFileSync(stylesPath, 'utf8');
+  const app = fs.readFileSync(appPath, 'utf8');
   const html = fs.readFileSync(indexPath, 'utf8');
   const boot = fs.readFileSync(bootPath, 'utf8');
   assert.ok(html.indexOf('floatingBubbleBoot.js') < html.indexOf('styles.css'));
   assert.match(boot, /floatingBubbleSide/);
   assert.match(boot, /suppressInitialNumberAnimation/);
   assert.match(boot, /__TOKEN_MONITOR_SUPPRESS_INITIAL_NUMBER_ANIMATION__/);
+  assert.match(boot, /\['home', 'tool', 'status', 'device', 'model', 'project', 'session', 'limits', 'trends'\]\.includes\(breakdown\)/);
   assert.match(boot, /document\.documentElement\.classList\.add/);
   assert.match(css, /html\.floating-bubble-collapsed-left,\s*body\.floating-bubble-collapsed-left/);
   assert.match(css, /html\.floating-bubble-collapsed-right,\s*body\.floating-bubble-collapsed-right/);
   const collapsedBlock = cssBlock(css, 'html\\.floating-bubble-collapsed-left,\\s*body\\.floating-bubble-collapsed-left,\\s*html\\.floating-bubble-collapsed-right,\\s*body\\.floating-bubble-collapsed-right');
+  const shellBlock = cssBlock(css, '\\.shell');
   const tabBlock = cssBlock(css, '\\.floating-bubble-tab');
-  assert.match(collapsedBlock, /rgb\(var\(--glass-rgb\)\);/);
+  const flatTabBlock = cssBlock(css, '\\.system-glass-disabled \\.floating-bubble-tab');
+  assert.match(collapsedBlock, /background:\s*transparent;/);
+  assert.match(shellBlock, /background:\s*var\(--glass\);/);
+  assert.match(shellBlock, /box-shadow:\s*0 22px 55px var\(--shadow\);/);
+  assert.doesNotMatch(shellBlock, /(?:^|\n)\s*border\s*:/);
+  assert.doesNotMatch(shellBlock, /box-shadow:[^;]*\binset\b/);
   assert.match(tabBlock, /appearance:\s*none;/);
   assert.match(tabBlock, /border:\s*0;/);
-  assert.match(tabBlock, /background:\s*transparent;/);
-  assert.match(tabBlock, /box-shadow:\s*none;/);
-  assert.match(tabBlock, /backdrop-filter:\s*none;/);
+  assert.match(tabBlock, /border-radius:\s*var\(--floating-bubble-radius\);/);
+  assert.match(app, /const BUBBLE_CONTENT_MIN_W = 34;/);
+  assert.match(tabBlock, /background:\s*var\(--glass\);/);
+  assert.match(tabBlock, /color:\s*var\(--number\);/);
+  assert.match(tabBlock, /backdrop-filter:\s*var\(--glass-filter\);/);
+  assert.doesNotMatch(tabBlock, /box-shadow/);
+  assert.match(flatTabBlock, /backdrop-filter:\s*none;/);
+  assert.doesNotMatch(flatTabBlock, /box-shadow/);
+  assert.match(app, /classList\.toggle\('system-glass-disabled', systemGlassDisabled\)/);
+  assert.match(boot, /query\.get\('systemGlassDisabled'\) === '1'/);
+  assert.match(css, /--glass-filter:\s*blur\(32px\) saturate\(115%\);/);
+  assert.doesNotMatch(css, /--glass-surface|--highlight-alpha|\.shell::after/);
+  assert.doesNotMatch(app, /--highlight-alpha/);
+  assert.doesNotMatch(css, /--bubble-(?:alpha|blur)/);
+  assert.doesNotMatch(app, /--bubble-(?:alpha|blur)/);
   assert.match(css, /html\.floating-bubble-collapsed-left body \.shell,\s*html\.floating-bubble-collapsed-right body \.shell/);
   assert.match(css, /html\.floating-bubble-collapsed-left body \.floating-bubble-tab/);
-  assert.match(css, /html\.floating-bubble-collapsed-left,\s*body\.floating-bubble-collapsed-left\s*\{[\s\S]*border-radius:\s*0;/);
+  assert.match(css, /html\.floating-bubble-collapsed-left,\s*body\.floating-bubble-collapsed-left\s*\{[\s\S]*border-radius:\s*var\(--floating-bubble-radius\);/);
+});
+
+test('generated floating bubble images use a device-scale-aware bitmap', () => {
+  const css = fs.readFileSync(stylesPath, 'utf8');
+  const app = fs.readFileSync(appPath, 'utf8');
+  const imageBlock = cssBlock(css, '\\.floating-bubble-tab span\\.bars img');
+  const renderStart = app.indexOf('function renderFloatingBubbleContent()');
+  const renderEnd = app.indexOf('function reportFloatingBubbleSize()', renderStart);
+  const renderBody = app.slice(renderStart, renderEnd);
+  const previewStart = app.indexOf('function trayComposerPreview(surface)');
+  const previewEnd = app.indexOf('function activateTrayComposer(surface)', previewStart);
+  const previewBody = app.slice(previewStart, previewEnd);
+
+  assert.match(imageBlock, /height:\s*24px;/);
+  assert.match(app, /const BUBBLE_GENERATED_IMAGE_CSS_HEIGHT = 24;/);
+  assert.match(
+    app,
+    /floatingBubbleBitmapHeight\(\s*window\.devicePixelRatio,\s*BUBBLE_GENERATED_IMAGE_CSS_HEIGHT\s*\)/
+  );
+  assert.match(renderBody, /const bitmapHeight = currentFloatingBubbleBitmapHeight\(\);/);
+  assert.match(renderBody, /trayDataUrlForMode\(mode, bitmapHeight,/);
+  assert.doesNotMatch(renderBody, /trayDataUrlForMode\(mode, 44,/);
+  assert.match(previewBody, /trayDataUrlForMode\(mode, currentFloatingBubbleBitmapHeight\(\),/);
+  assert.match(app, /watchDeviceScaleChanges\(\{[\s\S]*onChange:\s*refreshFloatingBubbleBitmapForDeviceScale/);
+  assert.match(app, /window\.addEventListener\('resize',[\s\S]*refreshFloatingBubbleBitmapForDeviceScale\(\);/);
 });
 
 test('floatingBubbleCollapsePlan honors a custom handle size', () => {
